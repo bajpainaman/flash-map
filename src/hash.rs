@@ -18,6 +18,7 @@ impl Default for HashStrategy {
 
 impl HashStrategy {
     /// Convert to u32 mode flag for the CUDA kernel.
+    #[allow(dead_code)]
     pub(crate) fn to_mode(&self) -> u32 {
         match self {
             Self::Identity => 0,

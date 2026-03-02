@@ -3,10 +3,14 @@ name = "flash-map"
 version = "0.1.0"
 edition = "2021"
 authors = ["Naman Bajpai"]
-description = "GPU-native concurrent hash map — 16B ops/sec on H100"
+description = "GPU-native concurrent hash map with bulk-only API. SoA layout, CUDA kernels, CPU fallback. Designed for blockchain state, HFT, and batch-parallel workloads."
 license = "MIT OR Apache-2.0"
-keywords = ["gpu", "cuda", "hashmap", "high-performance"]
+repository = "https://github.com/bajpainaman/flash-map"
+homepage = "https://github.com/bajpainaman/flash-map"
+readme = "README.md"
+keywords = ["gpu", "cuda", "hashmap", "high-performance", "concurrent"]
 categories = ["data-structures", "concurrency"]
+exclude = ["target/", ".git/"]
 
 [features]
 default = ["cpu-fallback"]

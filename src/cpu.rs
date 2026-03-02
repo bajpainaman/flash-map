@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::Pod;
 
 use crate::error::FlashMapError;
 use crate::hash::{HashStrategy, hash_key};
@@ -163,6 +163,7 @@ impl<K: Pod, V: Pod> CpuFlashMap<K, V> {
         self.len.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
