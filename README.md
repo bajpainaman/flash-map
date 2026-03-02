@@ -34,19 +34,31 @@ map.bulk_remove(&keys[..1000]).unwrap();
 
 ## Features
 
-- **`cuda`** — GPU backend via CUDA (requires NVIDIA GPU + CUDA 12+ toolkit)
-- **`cpu-fallback`** — CPU backend for development/testing (enabled by default)
+| Feature | Description |
+|---------|-------------|
+| `cpu-fallback` | Single-threaded CPU backend (default, works everywhere) |
+| `rayon` | Multi-threaded CPU backend using Rayon work-stealing |
+| `cuda` | GPU backend via CUDA (requires NVIDIA GPU + CUDA 12+) |
+| `tokio` | Async wrapper (`AsyncFlashMap`) for tokio runtimes |
 
 ```toml
-# CPU only (default, works everywhere)
+# CPU single-threaded (default)
 flash-map = "0.1"
+
+# Rayon multi-threaded CPU (recommended for CPU-only)
+flash-map = { version = "0.1", features = ["rayon"] }
+
+# Rayon + async support
+flash-map = { version = "0.1", features = ["rayon", "tokio"] }
 
 # GPU acceleration
 flash-map = { version = "0.1", features = ["cuda"] }
 
-# Both (tries GPU first, falls back to CPU)
-flash-map = { version = "0.1", features = ["cuda", "cpu-fallback"] }
+# GPU + Rayon fallback + async
+flash-map = { version = "0.1", features = ["cuda", "rayon", "tokio"] }
 ```
+
+Backend priority: **GPU > Rayon > CPU**. The builder tries each in order and falls back automatically.
 
 ## Applications
 
@@ -163,22 +175,55 @@ let query_kmers: Vec<Kmer> = extract_query_kmers(&target);
 let hits = kmer_counts.bulk_get(&query_kmers).unwrap();
 ```
 
+## Rayon Backend
+
+The `rayon` feature enables a multi-threaded CPU backend that mirrors the GPU kernel's concurrency model — each key gets its own rayon worker thread, and slots are claimed via `AtomicU32` CAS operations (identical to the CUDA `atomicCAS` pattern).
+
+```rust
+use flash_map::FlashMap;
+
+// Automatically uses Rayon backend when feature is enabled
+let mut map: FlashMap<[u8; 32], [u8; 128]> =
+    FlashMap::with_capacity(1_000_000).unwrap();
+
+let pairs: Vec<([u8; 32], [u8; 128])> = generate_pairs();
+map.bulk_insert(&pairs).unwrap(); // Parallel across all cores
+```
+
+## Async (Tokio)
+
+The `tokio` feature provides `AsyncFlashMap` — a thin async wrapper that runs bulk operations on `spawn_blocking` threads to avoid stalling the async executor.
+
+```rust
+use flash_map::{FlashMap, AsyncFlashMap};
+
+let map = FlashMap::with_capacity(1_000_000).unwrap();
+let async_map = AsyncFlashMap::new(map);
+
+// Share across tasks via Clone (Arc<RwLock> internally)
+let map_clone = async_map.clone();
+tokio::spawn(async move {
+    let keys = vec![[0u8; 32]];
+    let results = map_clone.bulk_get(keys).await.unwrap();
+});
+```
+
 ## Design
 
 ### Architecture
 
 ```
-                    FlashMap<K, V>
-                         │
-              ┌──────────┴──────────┐
-              │                     │
-        GPU Backend           CPU Backend
-        (cuda feature)     (cpu-fallback feature)
-              │
-    ┌─────────┼─────────┐
-    │         │         │
-  d_keys   d_flags   d_values     ← SoA layout on GPU
-  [u8]     [u32]     [u8]
+                       FlashMap<K, V>
+                            │
+              ┌─────────────┼─────────────┐
+              │             │             │
+        GPU Backend   Rayon Backend   CPU Backend
+          (cuda)        (rayon)     (cpu-fallback)
+              │             │
+    ┌─────────┤        AtomicU32 CAS
+    │    │    │        (lock-free)
+  d_keys d_flags d_values
+  [u8]   [u32]  [u8]       ← SoA layout on GPU
 ```
 
 **SoA (Struct of Arrays)**: Keys, flags, and values are stored in separate contiguous GPU buffers. This gives coalesced memory access when all threads read flags simultaneously, then keys, then values — instead of strided access through interleaved AoS records.

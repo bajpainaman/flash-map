@@ -28,4 +28,10 @@ pub enum FlashMapError {
 
     #[error("no backend available: enable 'cuda' or 'cpu-fallback' feature")]
     NoBackend,
+
+    #[error("internal lock poisoned")]
+    LockPoisoned,
+
+    #[error("async task join failed: {0}")]
+    AsyncJoin(String),
 }
