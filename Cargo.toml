@@ -1,0 +1,32 @@
+[package]
+name = "flash-map"
+version = "0.1.0"
+edition = "2021"
+authors = ["Naman Bajpai"]
+description = "GPU-native concurrent hash map — 16B ops/sec on H100"
+license = "MIT OR Apache-2.0"
+keywords = ["gpu", "cuda", "hashmap", "high-performance"]
+categories = ["data-structures", "concurrency"]
+
+[features]
+default = ["cpu-fallback"]
+cuda = ["dep:cudarc"]
+cpu-fallback = []
+
+[dependencies]
+cudarc = { version = "0.12", optional = true, features = ["cuda-12000"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
