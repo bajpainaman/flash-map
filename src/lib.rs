@@ -6,12 +6,12 @@
 //! - `bulk_remove`: parallel key removal (tombstone-based)
 //!
 //! SoA (Struct of Arrays) memory layout on GPU for coalesced access.
-//! Linear probing with identity hash (zero compute for pre-hashed keys).
+//! Robin Hood hashing with probe distance early exit.
 //!
 //! # Features
 //!
 //! - `cuda` — GPU backend via CUDA (requires NVIDIA GPU + CUDA toolkit)
-//! - `cpu-fallback` — CPU backend for development/testing (default)
+//! - `rayon` — multi-threaded CPU backend (default)
 //!
 //! # Example
 //!
@@ -31,9 +31,9 @@
 //! # fn generate_pairs() -> Vec<([u8; 32], [u8; 128])> { vec![] }
 //! ```
 
-#[cfg(not(any(feature = "cuda", feature = "rayon", feature = "cpu-fallback")))]
+#[cfg(not(any(feature = "cuda", feature = "rayon")))]
 compile_error!(
-    "flash-map: enable at least one of 'cuda', 'rayon', or 'cpu-fallback' features"
+    "flash-map: enable at least one of 'cuda' or 'rayon' features"
 );
 
 mod error;
@@ -41,9 +41,6 @@ mod hash;
 
 #[cfg(feature = "cuda")]
 mod gpu;
-
-#[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-mod cpu;
 
 #[cfg(feature = "rayon")]
 mod rayon_cpu;
@@ -83,14 +80,12 @@ enum FlashMapBackend<K: PodBound, V: PodBound> {
     Gpu(gpu::GpuFlashMap<K, V>),
     #[cfg(feature = "rayon")]
     Rayon(rayon_cpu::RayonFlashMap<K, V>),
-    #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-    Cpu(cpu::CpuFlashMap<K, V>),
 }
 
 impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
     /// Create a FlashMap with the given capacity using default settings.
     ///
-    /// Tries GPU first (if `cuda` feature enabled), falls back to CPU.
+    /// Tries GPU first (if `cuda` feature enabled), falls back to Rayon.
     /// Capacity is rounded up to the next power of 2.
     pub fn with_capacity(capacity: usize) -> Result<Self, FlashMapError> {
         FlashMapBuilder::new(capacity).build()
@@ -108,8 +103,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.bulk_get(keys),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.bulk_get(keys),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.bulk_get(keys),
         }
     }
 
@@ -129,8 +122,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.bulk_insert(pairs),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.bulk_insert(pairs),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.bulk_insert(pairs),
         }
     }
 
@@ -143,8 +134,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.bulk_remove(keys),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.bulk_remove(keys),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.bulk_remove(keys),
         }
     }
 
@@ -155,8 +144,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.len(),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.len(),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.len(),
         }
     }
 
@@ -172,8 +159,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.capacity(),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.capacity(),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.capacity(),
         }
     }
 
@@ -184,8 +169,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.load_factor(),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.load_factor(),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.load_factor(),
         }
     }
 
@@ -196,8 +179,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.clear(),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.clear(),
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(m) => m.clear(),
         }
     }
 }
@@ -211,8 +192,6 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> std::fmt::Debug
             FlashMapBackend::Gpu(_) => "GPU",
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(_) => "Rayon",
-            #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-            FlashMapBackend::Cpu(_) => "CPU",
         };
         f.debug_struct("FlashMap")
             .field("backend", &backend)
@@ -232,7 +211,7 @@ pub struct FlashMapBuilder {
     capacity: usize,
     hash_strategy: HashStrategy,
     device_id: usize,
-    force_cpu: bool,
+    force_rayon: bool,
 }
 
 impl FlashMapBuilder {
@@ -242,7 +221,7 @@ impl FlashMapBuilder {
             capacity,
             hash_strategy: HashStrategy::Identity,
             device_id: 0,
-            force_cpu: false,
+            force_rayon: false,
         }
     }
 
@@ -258,20 +237,20 @@ impl FlashMapBuilder {
         self
     }
 
-    /// Force CPU backend even if CUDA is available.
+    /// Force Rayon backend even if CUDA is available.
     pub fn force_cpu(mut self) -> Self {
-        self.force_cpu = true;
+        self.force_rayon = true;
         self
     }
 
-    /// Build the FlashMap. Tries GPU first, falls back to CPU if available.
+    /// Build the FlashMap. Tries GPU first, falls back to Rayon.
     pub fn build<K: PodBound + Send + Sync, V: PodBound + Send + Sync>(
         self,
     ) -> Result<FlashMap<K, V>, FlashMapError> {
         let mut _gpu_err: Option<FlashMapError> = None;
 
         #[cfg(feature = "cuda")]
-        if !self.force_cpu {
+        if !self.force_rayon {
             match gpu::GpuFlashMap::<K, V>::new(
                 self.capacity,
                 self.hash_strategy,
@@ -289,19 +268,6 @@ impl FlashMapBuilder {
             }
             return Ok(FlashMap {
                 inner: FlashMapBackend::Rayon(rayon_cpu::RayonFlashMap::new(
-                    self.capacity,
-                    self.hash_strategy,
-                )),
-            });
-        }
-
-        #[cfg(all(feature = "cpu-fallback", not(feature = "rayon")))]
-        {
-            if let Some(ref e) = _gpu_err {
-                eprintln!("[flash-map] GPU unavailable ({e}), using CPU fallback");
-            }
-            return Ok(FlashMap {
-                inner: FlashMapBackend::Cpu(cpu::CpuFlashMap::new(
                     self.capacity,
                     self.hash_strategy,
                 )),
