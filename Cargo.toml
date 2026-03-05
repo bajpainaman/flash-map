@@ -1,6 +1,6 @@
 [package]
 name = "flash-map"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Naman Bajpai"]
 description = "GPU-native concurrent hash map with bulk-only API. SoA layout, CUDA kernels, CPU fallback. Designed for blockchain state, HFT, and batch-parallel workloads."

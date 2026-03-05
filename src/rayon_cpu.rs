@@ -19,14 +19,29 @@ impl<T> SendPtr<T> {
     }
 }
 
-const MAX_LOAD_FACTOR: f64 = 0.5;
+const MAX_LOAD_FACTOR: f64 = 1.0;
 const FLAG_EMPTY: u32 = 0;
 const FLAG_OCCUPIED: u32 = 1;
 const FLAG_TOMBSTONE: u32 = 2;
 const FLAG_INSERTING: u32 = 3;
 
-/// Rayon-parallelized CPU FlashMap — uses atomic flags for concurrent
-/// insert/remove, mirroring the GPU kernel's CAS-based concurrency model.
+#[inline]
+const fn get_flag(f: u32) -> u32 {
+    f & 0xF
+}
+
+#[inline]
+const fn get_dist(f: u32) -> usize {
+    (f >> 4) as usize
+}
+
+#[inline]
+const fn make_flag(flag: u32, dist: usize) -> u32 {
+    ((dist as u32) << 4) | (flag & 0xF)
+}
+
+/// Rayon-parallelized CPU FlashMap — Robin Hood hashing with atomic flags
+/// for concurrent insert/remove, mirroring the GPU kernel's CAS model.
 pub struct RayonFlashMap<K: Pod, V: Pod> {
     keys: Vec<K>,
     values: Vec<V>,
@@ -61,8 +76,9 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
         }
     }
 
-    /// Parallel bulk lookup using rayon. Each key lookup runs on a
-    /// separate rayon worker — reads are lock-free against the atomic flags.
+    /// Parallel bulk lookup with Robin Hood early exit.
+    ///
+    /// Terminates miss probes when `probe_depth > stored_distance`.
     pub fn bulk_get(&self, keys: &[K]) -> Result<Vec<Option<V>>, FlashMapError> {
         let results: Vec<Option<V>> = keys
             .par_iter()
@@ -74,23 +90,29 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                 let mut p: usize = 0;
                 while p <= self.capacity_mask {
                     let idx = (slot + p) & self.capacity_mask;
-                    let flag = self.flags[idx].load(Ordering::Acquire);
+                    let f = self.flags[idx].load(Ordering::Acquire);
+                    let flag = get_flag(f);
+                    let dist = get_dist(f);
 
                     if flag == FLAG_EMPTY {
                         return None;
-                    }
-
-                    if flag == FLAG_OCCUPIED {
-                        let tk_bytes = bytemuck::bytes_of(&self.keys[idx]);
-                        if tk_bytes == qk_bytes {
-                            return Some(self.values[idx]);
-                        }
                     }
 
                     if flag == FLAG_INSERTING {
                         // Another thread is mid-write — spin on this slot
                         std::hint::spin_loop();
                         continue;
+                    }
+
+                    if flag == FLAG_OCCUPIED {
+                        // Robin Hood early exit
+                        if p > dist {
+                            return None;
+                        }
+                        let tk_bytes = bytemuck::bytes_of(&self.keys[idx]);
+                        if tk_bytes == qk_bytes {
+                            return Some(self.values[idx]);
+                        }
                     }
 
                     // TOMBSTONE or different occupied key — advance
@@ -103,11 +125,11 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
         Ok(results)
     }
 
-    /// Parallel bulk insert using rayon with atomic CAS on flags.
+    /// Parallel bulk insert with Robin Hood eviction and atomic CAS.
     ///
-    /// Each thread claims a slot via CAS(EMPTY|TOMBSTONE → INSERTING),
-    /// writes key+value, then publishes via store(OCCUPIED, Release).
-    /// This mirrors the CUDA kernel's atomicCAS pattern.
+    /// When a new key's probe distance exceeds a resident's, the resident
+    /// is evicted and re-inserted further. Each eviction uses CAS to
+    /// atomically claim the slot, matching the CUDA kernel's pattern.
     pub fn bulk_insert(&self, pairs: &[(K, V)]) -> Result<usize, FlashMapError> {
         let current_len = self.len.load(Ordering::Relaxed);
         let max_occupancy = (self.capacity as f64 * MAX_LOAD_FACTOR) as usize;
@@ -128,35 +150,88 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
         let kp = SendPtr(self.keys.as_ptr() as *mut K);
         let vp = SendPtr(self.values.as_ptr() as *mut V);
 
-        pairs.par_iter().for_each(|(key, value)| {
+        pairs.par_iter().for_each(|&(key, value)| {
             let keys_raw = kp.ptr();
             let vals_raw = vp.ptr();
-            let kbytes = bytemuck::bytes_of(key);
-            let slot =
-                hash_key(kbytes, self.hash_strategy) as usize & self.capacity_mask;
 
+            let mut cur_key = key;
+            let mut cur_val = value;
+            let mut home = hash_key(
+                bytemuck::bytes_of(&cur_key),
+                self.hash_strategy,
+            ) as usize
+                & self.capacity_mask;
             let mut p: usize = 0;
-            while p <= self.capacity_mask {
-                let idx = (slot + p) & self.capacity_mask;
-                let flag = self.flags[idx].load(Ordering::Acquire);
+
+            loop {
+                if p > self.capacity_mask {
+                    return; // table full (shouldn't happen due to pre-check)
+                }
+
+                let idx = (home + p) & self.capacity_mask;
+                let f = self.flags[idx].load(Ordering::Acquire);
+                let flag = get_flag(f);
+                let dist = get_dist(f);
 
                 if flag == FLAG_OCCUPIED {
                     let tk = bytemuck::bytes_of(&self.keys[idx]);
-                    if tk == kbytes {
+                    if tk == bytemuck::bytes_of(&cur_key) {
                         // Update existing — we own the slot (key matches)
-                        unsafe { vals_raw.add(idx).write(*value) };
+                        unsafe { vals_raw.add(idx).write(cur_val) };
                         return;
                     }
+
+                    if p > dist {
+                        // Robin Hood: evict resident, take slot
+                        let new_f = make_flag(FLAG_INSERTING, p);
+                        if self.flags[idx]
+                            .compare_exchange(
+                                f,
+                                new_f,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            // Read evicted key/val, write ours
+                            let evict_key = unsafe { keys_raw.add(idx).read() };
+                            let evict_val = unsafe { vals_raw.add(idx).read() };
+                            unsafe {
+                                keys_raw.add(idx).write(cur_key);
+                                vals_raw.add(idx).write(cur_val);
+                            }
+                            self.flags[idx].store(
+                                make_flag(FLAG_OCCUPIED, p),
+                                Ordering::Release,
+                            );
+
+                            // Continue inserting evicted key
+                            cur_key = evict_key;
+                            cur_val = evict_val;
+                            home = hash_key(
+                                bytemuck::bytes_of(&cur_key),
+                                self.hash_strategy,
+                            ) as usize
+                                & self.capacity_mask;
+                            p = dist + 1;
+                            continue;
+                        }
+                        // CAS failed — retry same slot
+                        std::hint::spin_loop();
+                        continue;
+                    }
+
                     p += 1;
                     continue;
                 }
 
                 if flag == FLAG_EMPTY || flag == FLAG_TOMBSTONE {
                     // Try to claim this slot
+                    let new_f = make_flag(FLAG_INSERTING, p);
                     if self.flags[idx]
                         .compare_exchange(
-                            flag,
-                            FLAG_INSERTING,
+                            f,
+                            new_f,
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         )
@@ -164,10 +239,13 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                     {
                         // We own this slot — write key+value, then publish
                         unsafe {
-                            keys_raw.add(idx).write(*key);
-                            vals_raw.add(idx).write(*value);
+                            keys_raw.add(idx).write(cur_key);
+                            vals_raw.add(idx).write(cur_val);
                         }
-                        self.flags[idx].store(FLAG_OCCUPIED, Ordering::Release);
+                        self.flags[idx].store(
+                            make_flag(FLAG_OCCUPIED, p),
+                            Ordering::Release,
+                        );
                         num_new.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -191,8 +269,7 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
         Ok(added)
     }
 
-    /// Parallel bulk remove using rayon. Uses CAS to atomically transition
-    /// OCCUPIED → TOMBSTONE for matching keys.
+    /// Parallel bulk remove with Robin Hood early exit.
     pub fn bulk_remove(&self, keys: &[K]) -> Result<usize, FlashMapError> {
         let num_removed = AtomicUsize::new(0);
 
@@ -204,7 +281,9 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
             let mut p: usize = 0;
             while p <= self.capacity_mask {
                 let idx = (slot + p) & self.capacity_mask;
-                let flag = self.flags[idx].load(Ordering::Acquire);
+                let f = self.flags[idx].load(Ordering::Acquire);
+                let flag = get_flag(f);
+                let dist = get_dist(f);
 
                 if flag == FLAG_EMPTY {
                     return;
@@ -217,12 +296,16 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                 }
 
                 if flag == FLAG_OCCUPIED {
+                    // Robin Hood early exit
+                    if p > dist {
+                        return;
+                    }
                     let tk = bytemuck::bytes_of(&self.keys[idx]);
                     if tk == kbytes {
                         // CAS to ensure we don't double-remove
                         if self.flags[idx]
                             .compare_exchange(
-                                FLAG_OCCUPIED,
+                                f,
                                 FLAG_TOMBSTONE,
                                 Ordering::AcqRel,
                                 Ordering::Relaxed,

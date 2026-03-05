@@ -214,8 +214,8 @@ fn empty_operations_are_no_ops() {
 fn table_full_error() {
     let mut map: FlashMap<[u8; 8], [u8; 8]> = FlashMap::with_capacity(16).unwrap();
 
-    // Capacity rounds to 16, max load 50% = 8 entries
-    let pairs: Vec<_> = (0u64..8)
+    // Capacity rounds to 16, max load 100% = 16 entries
+    let pairs: Vec<_> = (0u64..16)
         .map(|i| (i.to_le_bytes(), i.to_le_bytes()))
         .collect();
     map.bulk_insert(&pairs).unwrap();
@@ -246,5 +246,147 @@ fn u64_key_value_types() {
     let results = map.bulk_get(&keys).unwrap();
     for (i, r) in results.iter().enumerate() {
         assert_eq!(r, &Some((i as u64) * (i as u64)));
+    }
+}
+
+// =========================================================================
+// Robin Hood hashing tests
+// =========================================================================
+
+#[test]
+fn robin_hood_high_load_correctness() {
+    // Test at 80%, 90%, 95% load — Robin Hood must not lose data
+    for load_pct in [80, 90, 95] {
+        let capacity = 1024_usize;
+        let n = capacity * load_pct / 100;
+
+        let mut map: FlashMap<[u8; 8], [u8; 8]> =
+            FlashMap::with_capacity(capacity).unwrap();
+
+        let pairs: Vec<_> = (0..n as u64)
+            .map(|i| (i.to_le_bytes(), (i * 7).to_le_bytes()))
+            .collect();
+        let inserted = map.bulk_insert(&pairs).unwrap();
+        assert_eq!(inserted, n, "wrong insert count at {load_pct}% load");
+        assert_eq!(map.len(), n);
+
+        // Every inserted key must be retrievable
+        let keys: Vec<_> = (0..n as u64).map(|i| i.to_le_bytes()).collect();
+        let results = map.bulk_get(&keys).unwrap();
+        for (i, r) in results.iter().enumerate() {
+            let expected = (i as u64 * 7).to_le_bytes();
+            assert_eq!(
+                r,
+                &Some(expected),
+                "missing key {i} at {load_pct}% load"
+            );
+        }
+    }
+}
+
+#[test]
+fn robin_hood_miss_exits_early() {
+    // At high load, missing keys must still return None (not hang or panic)
+    let capacity = 1024_usize;
+    let n = capacity * 90 / 100; // 90% load
+
+    let mut map: FlashMap<[u8; 8], [u8; 8]> =
+        FlashMap::with_capacity(capacity).unwrap();
+
+    let pairs: Vec<_> = (0..n as u64)
+        .map(|i| (i.to_le_bytes(), i.to_le_bytes()))
+        .collect();
+    map.bulk_insert(&pairs).unwrap();
+
+    // Keys that were never inserted — should all be None
+    let missing: Vec<_> = (10_000u64..10_500)
+        .map(|i| i.to_le_bytes())
+        .collect();
+    let results = map.bulk_get(&missing).unwrap();
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.is_none(), "false positive at index {i}");
+    }
+}
+
+#[test]
+fn robin_hood_insert_remove_reinsert() {
+    let capacity = 512_usize;
+    let n = capacity * 80 / 100;
+
+    let mut map: FlashMap<[u8; 8], [u8; 8]> =
+        FlashMap::with_capacity(capacity).unwrap();
+
+    // Fill to 80%
+    let pairs: Vec<_> = (0..n as u64)
+        .map(|i| (i.to_le_bytes(), i.to_le_bytes()))
+        .collect();
+    map.bulk_insert(&pairs).unwrap();
+
+    // Remove half
+    let remove_keys: Vec<_> = (0..n as u64 / 2)
+        .map(|i| i.to_le_bytes())
+        .collect();
+    let removed = map.bulk_remove(&remove_keys).unwrap();
+    assert_eq!(removed, n / 2);
+
+    // Reinsert different keys into tombstone slots
+    let new_pairs: Vec<_> = (10_000u64..10_000 + n as u64 / 2)
+        .map(|i| (i.to_le_bytes(), (i * 3).to_le_bytes()))
+        .collect();
+    let reinserted = map.bulk_insert(&new_pairs).unwrap();
+    assert_eq!(reinserted, n / 2);
+
+    // Verify surviving original keys
+    let surviving: Vec<_> = (n as u64 / 2..n as u64)
+        .map(|i| i.to_le_bytes())
+        .collect();
+    let results = map.bulk_get(&surviving).unwrap();
+    for (i, r) in results.iter().enumerate() {
+        let key_val = i as u64 + n as u64 / 2;
+        assert_eq!(
+            r,
+            &Some(key_val.to_le_bytes()),
+            "lost surviving key {key_val}"
+        );
+    }
+
+    // Verify new keys
+    let new_keys: Vec<_> = (10_000u64..10_000 + n as u64 / 2)
+        .map(|i| i.to_le_bytes())
+        .collect();
+    let results = map.bulk_get(&new_keys).unwrap();
+    for (i, r) in results.iter().enumerate() {
+        let expected = ((10_000 + i as u64) * 3).to_le_bytes();
+        assert_eq!(r, &Some(expected), "missing new key at index {i}");
+    }
+}
+
+#[test]
+fn robin_hood_update_at_high_load() {
+    let capacity = 1024_usize;
+    let n = capacity * 45 / 100;
+
+    let mut map: FlashMap<[u8; 8], [u8; 8]> =
+        FlashMap::with_capacity(capacity).unwrap();
+
+    let pairs: Vec<_> = (0..n as u64)
+        .map(|i| (i.to_le_bytes(), i.to_le_bytes()))
+        .collect();
+    map.bulk_insert(&pairs).unwrap();
+
+    // Update all values
+    let updates: Vec<_> = (0..n as u64)
+        .map(|i| (i.to_le_bytes(), (i + 999).to_le_bytes()))
+        .collect();
+    let updated = map.bulk_insert(&updates).unwrap();
+    assert_eq!(updated, 0, "updates should not count as new inserts");
+    assert_eq!(map.len(), n);
+
+    // Verify updated values
+    let keys: Vec<_> = (0..n as u64).map(|i| i.to_le_bytes()).collect();
+    let results = map.bulk_get(&keys).unwrap();
+    for (i, r) in results.iter().enumerate() {
+        let expected = (i as u64 + 999).to_le_bytes();
+        assert_eq!(r, &Some(expected), "wrong value at index {i}");
     }
 }

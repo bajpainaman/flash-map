@@ -12,7 +12,7 @@ use crate::hash::HashStrategy;
 const CUDA_KERNEL_SOURCE: &str = include_str!("kernels.cu");
 const MODULE_NAME: &str = "flashmap";
 const THREADS_PER_BLOCK: u32 = 256;
-const MAX_LOAD_FACTOR: f64 = 0.5;
+const MAX_LOAD_FACTOR: f64 = 1.0;
 
 const KERNEL_NAMES: &[&str] = &[
     "flashmap_bulk_get",

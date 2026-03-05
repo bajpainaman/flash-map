@@ -177,7 +177,7 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
         }
     }
 
-    /// Current load factor (0.0 to 1.0). Max allowed is 0.5.
+    /// Current load factor (0.0 to 1.0).
     pub fn load_factor(&self) -> f64 {
         match &self.inner {
             #[cfg(feature = "cuda")]
