@@ -12,6 +12,7 @@ use crate::hash::HashStrategy;
 const CUDA_KERNEL_SOURCE: &str = include_str!("kernels.cu");
 const MODULE_NAME: &str = "flashmap";
 const THREADS_PER_BLOCK: u32 = 256;
+const WARP_SIZE: u32 = 32;
 const MAX_LOAD_FACTOR: f64 = 1.0;
 
 const KERNEL_NAMES: &[&str] = &[
@@ -119,11 +120,12 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
             .get_func(MODULE_NAME, "flashmap_bulk_get")
             .ok_or_else(|| FlashMapError::KernelLaunch("flashmap_bulk_get not found".into()))?;
 
-        let grid = ((n as u32 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 1, 1);
-        let block = (THREADS_PER_BLOCK, 1, 1);
+        // Warp-cooperative: 1 warp (32 threads) per query
+        let total_threads = n as u32 * WARP_SIZE;
+        let grid = ((total_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 1, 1);
         let cfg = LaunchConfig {
             grid_dim: grid,
-            block_dim: block,
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
 
@@ -281,7 +283,9 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
             .get_func(MODULE_NAME, "flashmap_bulk_remove")
             .ok_or_else(|| FlashMapError::KernelLaunch("flashmap_bulk_remove not found".into()))?;
 
-        let grid = ((n as u32 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 1, 1);
+        // Warp-cooperative: 1 warp (32 threads) per query
+        let total_threads = n as u32 * WARP_SIZE;
+        let grid = ((total_threads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 1, 1);
         let cfg = LaunchConfig {
             grid_dim: grid,
             block_dim: (THREADS_PER_BLOCK, 1, 1),
