@@ -26,8 +26,11 @@ pub enum FlashMapError {
     #[error("capacity must be positive")]
     ZeroCapacity,
 
-    #[error("no backend available: enable 'cuda' or 'cpu-fallback' feature")]
+    #[error("no backend available: enable 'cuda' or 'rayon' feature")]
     NoBackend,
+
+    #[error("device-resident API requires GPU backend (currently using Rayon)")]
+    GpuRequired,
 
     #[error("internal lock poisoned")]
     LockPoisoned,

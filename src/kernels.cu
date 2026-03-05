@@ -213,137 +213,6 @@ __device__ __forceinline__ void fm_swap(
 #endif
 
 // ============================================================================
-#ifdef COMPILE_QUERY
-// ============================================================================
-// Warp-Cooperative Bulk Lookup
-//
-// 1 warp (32 threads) handles 1 query. Each iteration, 32 lanes probe 32
-// consecutive slots in parallel. __ballot_sync detects:
-//   - EMPTY slot → key definitely absent (Robin Hood or not)
-//   - OCCUPIED with matching key → found
-//   - Robin Hood early exit: probe_depth > stored distance
-//
-// Lane 0 broadcasts the query's home slot to all lanes via __shfl_sync.
-// Each lane probes slot (home + base + lane) & capacity_mask.
-//
-// Exit logic:
-//   1. If any lane sees EMPTY → key can't be further. Done.
-//   2. If any lane finds a match → copy value, mark found. Done.
-//   3. Robin Hood exit: find earliest lane where probe_dist > resident_dist
-//      AND slot is not TOMBSTONE. Any match must be before that lane.
-//      Filter match_mask to only include lanes before first_exit.
-// ============================================================================
-
-extern "C" __global__ void flashmap_bulk_get(
-    const unsigned char* __restrict__ keys,
-    const unsigned int*  __restrict__ flags,
-    const unsigned char* __restrict__ values,
-    const unsigned char* __restrict__ query_keys,
-    unsigned char*       __restrict__ out_values,
-    unsigned char*       __restrict__ out_found,
-    unsigned long long capacity_mask,
-    unsigned int key_size,
-    unsigned int value_size,
-    unsigned int num_queries,
-    unsigned int hash_mode
-) {
-    unsigned int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int warp_id = global_tid / WARP_SIZE;
-    unsigned int lane = global_tid % WARP_SIZE;
-
-    if (warp_id >= num_queries) return;
-
-    // Lane 0 computes hash, broadcasts to all lanes
-    const unsigned char* qk = query_keys + (unsigned long long)warp_id * key_size;
-    unsigned long long home = 0;
-    if (lane == 0) {
-        home = fm_hash(qk, key_size, hash_mode) & capacity_mask;
-    }
-    home = __shfl_sync(FULL_WARP_MASK, home, 0);
-
-    unsigned long long base = 0;
-
-    while (base <= capacity_mask) {
-        unsigned long long probe_dist = base + lane;
-        unsigned long long idx = (home + probe_dist) & capacity_mask;
-
-        // Each lane loads its slot's flag
-        unsigned int f = __ldg(&flags[idx]);
-        unsigned int flag = GET_FLAG(f);
-        unsigned int dist = GET_DIST(f);
-
-        // Detect EMPTY slots across warp
-        unsigned int empty_mask = __ballot_sync(FULL_WARP_MASK, flag == FLAG_EMPTY);
-
-        // Detect Robin Hood early exit: probe deeper than resident
-        // Only for OCCUPIED slots (tombstones don't count for RH exit)
-        unsigned int rh_exit = (flag == FLAG_OCCUPIED && probe_dist > dist) ? 1u : 0u;
-        unsigned int exit_mask = __ballot_sync(FULL_WARP_MASK, rh_exit);
-
-        // Combined termination mask: either EMPTY or RH early exit
-        unsigned int term_mask = empty_mask | exit_mask;
-
-        // Detect key matches (only in OCCUPIED, non-INSERTING slots)
-        unsigned int is_match = 0u;
-        if (flag == FLAG_OCCUPIED && probe_dist <= capacity_mask) {
-            is_match = fm_keys_equal(keys + idx * key_size, qk, key_size) ? 1u : 0u;
-        }
-        unsigned int match_mask = __ballot_sync(FULL_WARP_MASK, is_match);
-
-        // If there's a termination point, only matches BEFORE it are valid
-        if (term_mask != 0u) {
-            unsigned int first_term = __ffs(term_mask) - 1; // 0-indexed lane
-            unsigned int valid_mask = (first_term < 31u) ? ((1u << (first_term + 1)) - 1) : FULL_WARP_MASK;
-            match_mask &= valid_mask;
-        }
-
-        if (match_mask != 0u) {
-            // Found! Lane with the match copies the value
-            unsigned int winner = __ffs(match_mask) - 1;
-            if (lane == winner) {
-                fm_copy_ldg(
-                    out_values + (unsigned long long)warp_id * value_size,
-                    values + idx * value_size,
-                    value_size
-                );
-                out_found[warp_id] = 1;
-            }
-            return;
-        }
-
-        // If any termination lane was hit and no match found → miss
-        if (term_mask != 0u) {
-            if (lane == 0) {
-                out_found[warp_id] = 0;
-            }
-            return;
-        }
-
-        // Check if any lane is spinning on INSERTING — if so, don't advance
-        // past those slots. But we can advance past completed slots.
-        unsigned int inserting_mask = __ballot_sync(FULL_WARP_MASK, flag == FLAG_INSERTING);
-        if (inserting_mask != 0u) {
-            // Retry from the first INSERTING lane's position
-            unsigned int first_inserting = __ffs(inserting_mask) - 1;
-            base += first_inserting;
-            continue;
-        }
-
-        // All 32 lanes saw OCCUPIED or TOMBSTONE with no match — advance 32
-        base += WARP_SIZE;
-    }
-
-    // Wrapped entire table — not found
-    if (lane == 0) {
-        out_found[warp_id] = 0;
-    }
-}
-
-// ============================================================================
-#endif // COMPILE_QUERY
-// ============================================================================
-
-// ============================================================================
 #ifdef COMPILE_INSERT
 // ============================================================================
 // Bulk Insert — Robin Hood with eviction (1 thread per key)
@@ -473,6 +342,219 @@ extern "C" __global__ void flashmap_count(
 
 // ============================================================================
 #ifdef COMPILE_QUERY
+// ============================================================================
+// Warp-Cooperative Bulk Lookup
+//
+// 1 warp (32 threads) handles 1 query. Each iteration, 32 lanes probe 32
+// consecutive slots in parallel. __ballot_sync detects:
+//   - EMPTY slot → key definitely absent (Robin Hood or not)
+//   - OCCUPIED with matching key → found
+//   - Robin Hood early exit: probe_depth > stored distance
+//
+// Lane 0 broadcasts the query's home slot to all lanes via __shfl_sync.
+// Each lane probes slot (home + base + lane) & capacity_mask.
+//
+// Exit logic:
+//   1. If any lane sees EMPTY → key can't be further. Done.
+//   2. If any lane finds a match → copy value, mark found. Done.
+//   3. Robin Hood exit: find earliest lane where probe_dist > resident_dist
+//      AND slot is not TOMBSTONE. Any match must be before that lane.
+//      Filter match_mask to only include lanes before first_exit.
+// ============================================================================
+
+extern "C" __global__ void flashmap_bulk_get(
+    const unsigned char* __restrict__ keys,
+    const unsigned int*  __restrict__ flags,
+    const unsigned char* __restrict__ values,
+    const unsigned char* __restrict__ query_keys,
+    unsigned char*       __restrict__ out_values,
+    unsigned char*       __restrict__ out_found,
+    unsigned long long capacity_mask,
+    unsigned int key_size,
+    unsigned int value_size,
+    unsigned int num_queries,
+    unsigned int hash_mode
+) {
+    unsigned int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int warp_id = global_tid / WARP_SIZE;
+    unsigned int lane = global_tid % WARP_SIZE;
+
+    if (warp_id >= num_queries) return;
+
+    // Lane 0 computes hash, broadcasts to all lanes
+    const unsigned char* qk = query_keys + (unsigned long long)warp_id * key_size;
+    unsigned long long home = 0;
+    if (lane == 0) {
+        home = fm_hash(qk, key_size, hash_mode) & capacity_mask;
+    }
+    home = __shfl_sync(FULL_WARP_MASK, home, 0);
+
+    unsigned long long base = 0;
+
+    while (base <= capacity_mask) {
+        unsigned long long probe_dist = base + lane;
+        unsigned long long idx = (home + probe_dist) & capacity_mask;
+
+        // Each lane loads its slot's flag
+        unsigned int f = __ldg(&flags[idx]);
+        unsigned int flag = GET_FLAG(f);
+        unsigned int dist = GET_DIST(f);
+
+        // Detect EMPTY slots across warp
+        unsigned int empty_mask = __ballot_sync(FULL_WARP_MASK, flag == FLAG_EMPTY);
+
+        // Detect Robin Hood early exit: probe deeper than resident
+        // Only for OCCUPIED slots (tombstones don't count for RH exit)
+        unsigned int rh_exit = (flag == FLAG_OCCUPIED && probe_dist > dist) ? 1u : 0u;
+        unsigned int exit_mask = __ballot_sync(FULL_WARP_MASK, rh_exit);
+
+        // Combined termination mask: either EMPTY or RH early exit
+        unsigned int term_mask = empty_mask | exit_mask;
+
+        // Detect key matches (only in OCCUPIED, non-INSERTING slots)
+        unsigned int is_match = 0u;
+        if (flag == FLAG_OCCUPIED && probe_dist <= capacity_mask) {
+            is_match = fm_keys_equal(keys + idx * key_size, qk, key_size) ? 1u : 0u;
+        }
+        unsigned int match_mask = __ballot_sync(FULL_WARP_MASK, is_match);
+
+        // If there's a termination point, only matches BEFORE it are valid
+        if (term_mask != 0u) {
+            unsigned int first_term = __ffs(term_mask) - 1; // 0-indexed lane
+            unsigned int valid_mask = (first_term < 31u) ? ((1u << (first_term + 1)) - 1) : FULL_WARP_MASK;
+            match_mask &= valid_mask;
+        }
+
+        if (match_mask != 0u) {
+            // Found! Lane with the match copies the value
+            unsigned int winner = __ffs(match_mask) - 1;
+            if (lane == winner) {
+                fm_copy_ldg(
+                    out_values + (unsigned long long)warp_id * value_size,
+                    values + idx * value_size,
+                    value_size
+                );
+                out_found[warp_id] = 1;
+            }
+            return;
+        }
+
+        // If any termination lane was hit and no match found → miss
+        if (term_mask != 0u) {
+            if (lane == 0) {
+                out_found[warp_id] = 0;
+            }
+            return;
+        }
+
+        // Check if any lane is spinning on INSERTING — if so, don't advance
+        // past those slots. But we can advance past completed slots.
+        unsigned int inserting_mask = __ballot_sync(FULL_WARP_MASK, flag == FLAG_INSERTING);
+        if (inserting_mask != 0u) {
+            // Retry from the first INSERTING lane's position
+            unsigned int first_inserting = __ffs(inserting_mask) - 1;
+            base += first_inserting;
+            continue;
+        }
+
+        // All 32 lanes saw OCCUPIED or TOMBSTONE with no match — advance 32
+        base += WARP_SIZE;
+    }
+
+    // Wrapped entire table — not found
+    if (lane == 0) {
+        out_found[warp_id] = 0;
+    }
+}
+
+// ============================================================================
+// Values-only lookup — no found mask, warp-cooperative
+//
+// Same algorithm as flashmap_bulk_get but without out_found output.
+// Missing keys get zeroed output (from alloc_zeros on host side).
+// Saves 1 device alloc + 1 global write per query.
+//
+// For pipelines where keys are guaranteed to exist (e.g., Merkle tree
+// child lookups in a fully populated tree).
+// ============================================================================
+
+extern "C" __global__ void flashmap_bulk_get_values_only(
+    const unsigned char* __restrict__ keys,
+    const unsigned int*  __restrict__ flags,
+    const unsigned char* __restrict__ values,
+    const unsigned char* __restrict__ query_keys,
+    unsigned char*       __restrict__ out_values,
+    unsigned long long capacity_mask,
+    unsigned int key_size,
+    unsigned int value_size,
+    unsigned int num_queries,
+    unsigned int hash_mode
+) {
+    unsigned int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int warp_id = global_tid / WARP_SIZE;
+    unsigned int lane = global_tid % WARP_SIZE;
+
+    if (warp_id >= num_queries) return;
+
+    const unsigned char* qk = query_keys + (unsigned long long)warp_id * key_size;
+    unsigned long long home = 0;
+    if (lane == 0) {
+        home = fm_hash(qk, key_size, hash_mode) & capacity_mask;
+    }
+    home = __shfl_sync(FULL_WARP_MASK, home, 0);
+
+    unsigned long long base = 0;
+
+    while (base <= capacity_mask) {
+        unsigned long long probe_dist = base + lane;
+        unsigned long long idx = (home + probe_dist) & capacity_mask;
+
+        unsigned int f = __ldg(&flags[idx]);
+        unsigned int flag = GET_FLAG(f);
+        unsigned int dist = GET_DIST(f);
+
+        unsigned int empty_mask = __ballot_sync(FULL_WARP_MASK, flag == FLAG_EMPTY);
+        unsigned int rh_exit = (flag == FLAG_OCCUPIED && probe_dist > dist) ? 1u : 0u;
+        unsigned int exit_mask = __ballot_sync(FULL_WARP_MASK, rh_exit);
+        unsigned int term_mask = empty_mask | exit_mask;
+
+        unsigned int is_match = 0u;
+        if (flag == FLAG_OCCUPIED && probe_dist <= capacity_mask) {
+            is_match = fm_keys_equal(keys + idx * key_size, qk, key_size) ? 1u : 0u;
+        }
+        unsigned int match_mask = __ballot_sync(FULL_WARP_MASK, is_match);
+
+        if (term_mask != 0u) {
+            unsigned int first_term = __ffs(term_mask) - 1;
+            unsigned int valid_mask = (first_term < 31u) ? ((1u << (first_term + 1)) - 1) : FULL_WARP_MASK;
+            match_mask &= valid_mask;
+        }
+
+        if (match_mask != 0u) {
+            unsigned int winner = __ffs(match_mask) - 1;
+            if (lane == winner) {
+                fm_copy_ldg(
+                    out_values + (unsigned long long)warp_id * value_size,
+                    values + idx * value_size,
+                    value_size
+                );
+            }
+            return;
+        }
+
+        if (term_mask != 0u) return;
+
+        unsigned int inserting_mask = __ballot_sync(FULL_WARP_MASK, flag == FLAG_INSERTING);
+        if (inserting_mask != 0u) {
+            unsigned int first_inserting = __ffs(inserting_mask) - 1;
+            base += first_inserting;
+            continue;
+        }
+
+        base += WARP_SIZE;
+    }
+}
+
 // ============================================================================
 // Warp-Cooperative Bulk Remove — Robin Hood early exit + atomicCAS tombstone
 //

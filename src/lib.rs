@@ -1,19 +1,21 @@
 //! FlashMap — GPU-native concurrent hash map.
 //!
 //! Bulk-only API designed for maximum GPU throughput:
-//! - `bulk_get`: parallel key lookup
-//! - `bulk_insert`: parallel key-value insertion (updates existing keys)
-//! - `bulk_remove`: parallel key removal (tombstone-based)
+//! - `bulk_get` / `bulk_insert` / `bulk_remove` — host-facing (H↔D transfers)
+//! - `bulk_get_device` / `bulk_insert_device` — device-resident (zero-copy)
+//! - `bulk_get_values_device` — values-only lookup (no found mask)
+//! - `bulk_insert_device_uncounted` — fire-and-forget insert (no readback)
 //!
 //! SoA (Struct of Arrays) memory layout on GPU for coalesced access.
 //! Robin Hood hashing with probe distance early exit.
+//! Warp-cooperative probing (32 slots per iteration).
 //!
 //! # Features
 //!
 //! - `cuda` — GPU backend via CUDA (requires NVIDIA GPU + CUDA toolkit)
 //! - `rayon` — multi-threaded CPU backend (default)
 //!
-//! # Example
+//! # Host API Example
 //!
 //! ```rust,no_run
 //! use flash_map::{FlashMap, HashStrategy};
@@ -21,14 +23,26 @@
 //! let mut map: FlashMap<[u8; 32], [u8; 128]> =
 //!     FlashMap::with_capacity(1_000_000).unwrap();
 //!
-//! // Insert 1M key-value pairs in one GPU kernel launch
 //! let pairs: Vec<([u8; 32], [u8; 128])> = generate_pairs();
 //! map.bulk_insert(&pairs).unwrap();
 //!
-//! // Lookup
 //! let keys: Vec<[u8; 32]> = pairs.iter().map(|(k, _)| *k).collect();
 //! let results: Vec<Option<[u8; 128]>> = map.bulk_get(&keys).unwrap();
 //! # fn generate_pairs() -> Vec<([u8; 32], [u8; 128])> { vec![] }
+//! ```
+//!
+//! # Device-Resident Pipeline Example
+//!
+//! ```rust,no_run,ignore
+//! use flash_map::FlashMap;
+//!
+//! let mut map = FlashMap::<u64, [u8; 32]>::with_capacity(1_000_000).unwrap();
+//!
+//! // Upload keys once (H→D), then all operations stay on GPU
+//! let d_keys = map.upload_keys(&[42u64]).unwrap();
+//! let d_vals = map.bulk_get_values_device(&d_keys, 1).unwrap();
+//! // d_vals is on GPU — pass to your CUDA kernel, then insert results back:
+//! // map.bulk_insert_device_uncounted(&d_new_keys, &d_new_vals, n).unwrap();
 //! ```
 
 #[cfg(not(any(feature = "cuda", feature = "rayon")))]
@@ -51,6 +65,12 @@ mod async_map;
 pub use bytemuck::Pod;
 pub use error::FlashMapError;
 pub use hash::HashStrategy;
+
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::CudaSlice;
+
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::CudaDevice;
 
 #[cfg(feature = "tokio")]
 pub use async_map::AsyncFlashMap;
@@ -95,6 +115,10 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
     pub fn builder(capacity: usize) -> FlashMapBuilder {
         FlashMapBuilder::new(capacity)
     }
+
+    // =================================================================
+    // Host-facing API (H↔D transfers per call)
+    // =================================================================
 
     /// Look up multiple keys in parallel. Returns `None` for missing keys.
     pub fn bulk_get(&self, keys: &[K]) -> Result<Vec<Option<V>>, FlashMapError> {
@@ -179,6 +203,149 @@ impl<K: PodBound + Send + Sync, V: PodBound + Send + Sync> FlashMap<K, V> {
             FlashMapBackend::Gpu(m) => m.clear(),
             #[cfg(feature = "rayon")]
             FlashMapBackend::Rayon(m) => m.clear(),
+        }
+    }
+
+    // =================================================================
+    // Device-resident API (zero-copy, GPU only)
+    // =================================================================
+
+    /// Reference to the CUDA device. Allows sharing device context
+    /// with external CUDA kernels (e.g., SHA256 hashers).
+    ///
+    /// Returns `None` if using the Rayon backend.
+    #[cfg(feature = "cuda")]
+    pub fn device(&self) -> Option<&std::sync::Arc<CudaDevice>> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => Some(m.device()),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => None,
+        }
+    }
+
+    /// Transfer host keys to a device buffer (H→D).
+    ///
+    /// Returns a `CudaSlice<u8>` of `keys.len() * size_of::<K>()` bytes
+    /// for use with `bulk_get_device` / `bulk_insert_device`.
+    #[cfg(feature = "cuda")]
+    pub fn upload_keys(&self, keys: &[K]) -> Result<CudaSlice<u8>, FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.upload_keys(keys),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Transfer host values to a device buffer (H→D).
+    #[cfg(feature = "cuda")]
+    pub fn upload_values(&self, values: &[V]) -> Result<CudaSlice<u8>, FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.upload_values(values),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Allocate a zeroed device buffer of `n` bytes.
+    #[cfg(feature = "cuda")]
+    pub fn alloc_device(&self, n: usize) -> Result<CudaSlice<u8>, FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.alloc_device(n),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Download a device buffer to host memory (D→H).
+    #[cfg(feature = "cuda")]
+    pub fn download(&self, d_buf: &CudaSlice<u8>) -> Result<Vec<u8>, FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.download(d_buf),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Device-to-device bulk lookup. No host memory touched.
+    ///
+    /// Returns `(d_values, d_found)` — both `CudaSlice<u8>` on GPU.
+    /// `d_found` has 1 byte per query (1 = found, 0 = miss).
+    #[cfg(feature = "cuda")]
+    pub fn bulk_get_device(
+        &self,
+        d_query_keys: &CudaSlice<u8>,
+        count: usize,
+    ) -> Result<(CudaSlice<u8>, CudaSlice<u8>), FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.bulk_get_device(d_query_keys, count),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Device-to-device values-only lookup. No found mask allocated.
+    ///
+    /// For pipelines where all keys are guaranteed to exist.
+    /// Missing keys get zeroed values (from alloc_zeros).
+    #[cfg(feature = "cuda")]
+    pub fn bulk_get_values_device(
+        &self,
+        d_query_keys: &CudaSlice<u8>,
+        count: usize,
+    ) -> Result<CudaSlice<u8>, FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.bulk_get_values_device(d_query_keys, count),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Device-to-device bulk insert. Keys and values already on GPU.
+    ///
+    /// Returns the number of new insertions (4-byte D→H readback).
+    #[cfg(feature = "cuda")]
+    pub fn bulk_insert_device(
+        &mut self,
+        d_keys: &CudaSlice<u8>,
+        d_values: &CudaSlice<u8>,
+        count: usize,
+    ) -> Result<usize, FlashMapError> {
+        match &mut self.inner {
+            FlashMapBackend::Gpu(m) => m.bulk_insert_device(d_keys, d_values, count),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Device-to-device insert without count readback. Fully async.
+    ///
+    /// No D→H sync. No load factor check (caller's responsibility).
+    /// Assumes all insertions are new. Call `recount()` if exact len needed.
+    #[cfg(feature = "cuda")]
+    pub fn bulk_insert_device_uncounted(
+        &mut self,
+        d_keys: &CudaSlice<u8>,
+        d_values: &CudaSlice<u8>,
+        count: usize,
+    ) -> Result<(), FlashMapError> {
+        match &mut self.inner {
+            FlashMapBackend::Gpu(m) => {
+                m.bulk_insert_device_uncounted(d_keys, d_values, count)
+            }
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
+        }
+    }
+
+    /// Recount occupied entries by scanning flags on GPU.
+    ///
+    /// Corrects internal `len` after `bulk_insert_device_uncounted`.
+    #[cfg(feature = "cuda")]
+    pub fn recount(&self) -> Result<usize, FlashMapError> {
+        match &self.inner {
+            FlashMapBackend::Gpu(m) => m.recount(),
+            #[cfg(feature = "rayon")]
+            FlashMapBackend::Rayon(_) => Err(FlashMapError::GpuRequired),
         }
     }
 }
