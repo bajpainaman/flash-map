@@ -71,7 +71,8 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                 let slot =
                     hash_key(qk_bytes, self.hash_strategy) as usize & self.capacity_mask;
 
-                for p in 0..self.capacity {
+                let mut p: usize = 0;
+                while p <= self.capacity_mask {
                     let idx = (slot + p) & self.capacity_mask;
                     let flag = self.flags[idx].load(Ordering::Acquire);
 
@@ -85,7 +86,15 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                             return Some(self.values[idx]);
                         }
                     }
-                    // TOMBSTONE or INSERTING — keep probing
+
+                    if flag == FLAG_INSERTING {
+                        // Another thread is mid-write — spin on this slot
+                        std::hint::spin_loop();
+                        continue;
+                    }
+
+                    // TOMBSTONE or different occupied key — advance
+                    p += 1;
                 }
                 None
             })
@@ -126,7 +135,8 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
             let slot =
                 hash_key(kbytes, self.hash_strategy) as usize & self.capacity_mask;
 
-            for p in 0..self.capacity {
+            let mut p: usize = 0;
+            while p <= self.capacity_mask {
                 let idx = (slot + p) & self.capacity_mask;
                 let flag = self.flags[idx].load(Ordering::Acquire);
 
@@ -137,6 +147,7 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                         unsafe { vals_raw.add(idx).write(*value) };
                         return;
                     }
+                    p += 1;
                     continue;
                 }
 
@@ -160,11 +171,18 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                         num_new.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    // CAS failed — another thread claimed it, retry same slot
+                    // CAS failed — retry same slot (don't increment p)
+                    std::hint::spin_loop();
                     continue;
                 }
 
-                // FLAG_INSERTING — another thread is writing, skip to next slot
+                if flag == FLAG_INSERTING {
+                    // Another thread is mid-write — spin on this slot
+                    std::hint::spin_loop();
+                    continue;
+                }
+
+                p += 1;
             }
         });
 
@@ -183,12 +201,19 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
             let slot =
                 hash_key(kbytes, self.hash_strategy) as usize & self.capacity_mask;
 
-            for p in 0..self.capacity {
+            let mut p: usize = 0;
+            while p <= self.capacity_mask {
                 let idx = (slot + p) & self.capacity_mask;
                 let flag = self.flags[idx].load(Ordering::Acquire);
 
                 if flag == FLAG_EMPTY {
                     return;
+                }
+
+                if flag == FLAG_INSERTING {
+                    // Another thread is mid-write — spin on this slot
+                    std::hint::spin_loop();
+                    continue;
                 }
 
                 if flag == FLAG_OCCUPIED {
@@ -209,6 +234,8 @@ impl<K: Pod + Send + Sync, V: Pod + Send + Sync> RayonFlashMap<K, V> {
                         return;
                     }
                 }
+
+                p += 1;
             }
         });
 

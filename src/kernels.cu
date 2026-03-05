@@ -132,13 +132,18 @@ extern "C" __global__ void flashmap_bulk_get(
     const unsigned char* qk = query_keys + (unsigned long long)tid * key_size;
     unsigned long long slot = fm_hash(qk, key_size, hash_mode) & capacity_mask;
 
-    for (unsigned long long p = 0; p <= capacity_mask; p++) {
+    for (unsigned long long p = 0; p <= capacity_mask; /* manual increment */) {
         unsigned long long idx = (slot + p) & capacity_mask;
         unsigned int f = flags[idx];
 
         if (f == FLAG_EMPTY) {
             out_found[tid] = 0;
             return;
+        }
+
+        if (f == FLAG_INSERTING) {
+            // Another thread is mid-write — spin on this slot
+            continue;
         }
 
         if (f == FLAG_OCCUPIED) {
@@ -151,7 +156,8 @@ extern "C" __global__ void flashmap_bulk_get(
                 return;
             }
         }
-        // TOMBSTONE or different occupied key — keep probing
+        // TOMBSTONE or different occupied key — advance
+        p++;
     }
 
     out_found[tid] = 0;
@@ -245,20 +251,27 @@ extern "C" __global__ void flashmap_bulk_remove(
     const unsigned char* qk = query_keys + (unsigned long long)tid * key_size;
     unsigned long long slot = fm_hash(qk, key_size, hash_mode) & capacity_mask;
 
-    for (unsigned long long p = 0; p <= capacity_mask; p++) {
+    for (unsigned long long p = 0; p <= capacity_mask; /* manual increment */) {
         unsigned long long idx = (slot + p) & capacity_mask;
         unsigned int f = flags[idx];
 
         if (f == FLAG_EMPTY) return;
 
+        if (f == FLAG_INSERTING) {
+            // Another thread is mid-write — spin on this slot
+            continue;
+        }
+
         if (f == FLAG_OCCUPIED) {
             if (fm_keys_equal(keys + idx * key_size, qk, key_size)) {
-                flags[idx] = FLAG_TOMBSTONE;
-                atomicAdd(num_removed, 1u);
+                unsigned int old = atomicCAS(&flags[idx], FLAG_OCCUPIED, FLAG_TOMBSTONE);
+                if (old == FLAG_OCCUPIED)
+                    atomicAdd(num_removed, 1u);
                 return;
             }
         }
-        // TOMBSTONE or different key — keep probing
+        // TOMBSTONE or different key — advance
+        p++;
     }
 }
 
