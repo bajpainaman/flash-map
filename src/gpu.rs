@@ -10,17 +10,21 @@ use crate::error::FlashMapError;
 use crate::hash::HashStrategy;
 
 const CUDA_KERNEL_SOURCE: &str = include_str!("kernels.cu");
-const MODULE_NAME: &str = "flashmap";
+const MODULE_INSERT: &str = "flashmap_insert";
+const MODULE_QUERY: &str = "flashmap_query";
 const THREADS_PER_BLOCK: u32 = 256;
 const WARP_SIZE: u32 = 32;
 const MAX_LOAD_FACTOR: f64 = 1.0;
 
-const KERNEL_NAMES: &[&str] = &[
-    "flashmap_bulk_get",
+const INSERT_KERNELS: &[&str] = &[
     "flashmap_bulk_insert",
-    "flashmap_bulk_remove",
     "flashmap_clear",
     "flashmap_count",
+];
+
+const QUERY_KERNELS: &[&str] = &[
+    "flashmap_bulk_get",
+    "flashmap_bulk_remove",
 ];
 
 /// GPU-backed FlashMap using CUDA kernels for bulk operations.
@@ -54,13 +58,24 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
         let device = CudaDevice::new(device_id)
             .map_err(|e| FlashMapError::CudaInit(e.to_string()))?;
 
-        // Compile CUDA source → PTX at runtime via NVRTC
-        let ptx = compile_ptx(CUDA_KERNEL_SOURCE)
-            .map_err(|e| FlashMapError::CudaInit(format!("PTX compile: {e}")))?;
+        // Compile insert and query kernels as separate PTX modules.
+        // This isolates register allocation so warp-coop intrinsics
+        // in query kernels don't cause register spill in the insert
+        // kernel's local arrays (cur_key/cur_val).
+        let insert_src = format!("#define COMPILE_INSERT\n{CUDA_KERNEL_SOURCE}");
+        let query_src = format!("#define COMPILE_QUERY\n{CUDA_KERNEL_SOURCE}");
+
+        let ptx_insert = compile_ptx(&insert_src)
+            .map_err(|e| FlashMapError::CudaInit(format!("PTX compile (insert): {e}")))?;
+        let ptx_query = compile_ptx(&query_src)
+            .map_err(|e| FlashMapError::CudaInit(format!("PTX compile (query): {e}")))?;
 
         device
-            .load_ptx(ptx, MODULE_NAME, KERNEL_NAMES)
-            .map_err(|e| FlashMapError::CudaInit(format!("module load: {e}")))?;
+            .load_ptx(ptx_insert, MODULE_INSERT, INSERT_KERNELS)
+            .map_err(|e| FlashMapError::CudaInit(format!("module load (insert): {e}")))?;
+        device
+            .load_ptx(ptx_query, MODULE_QUERY, QUERY_KERNELS)
+            .map_err(|e| FlashMapError::CudaInit(format!("module load (query): {e}")))?;
 
         // SoA device buffers — zeroed (all flags = EMPTY)
         let d_keys: CudaSlice<u8> = device
@@ -117,7 +132,7 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
 
         let func = self
             .device
-            .get_func(MODULE_NAME, "flashmap_bulk_get")
+            .get_func(MODULE_QUERY, "flashmap_bulk_get")
             .ok_or_else(|| FlashMapError::KernelLaunch("flashmap_bulk_get not found".into()))?;
 
         // Warp-cooperative: 1 warp (32 threads) per query
@@ -219,7 +234,7 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
 
         let func = self
             .device
-            .get_func(MODULE_NAME, "flashmap_bulk_insert")
+            .get_func(MODULE_INSERT, "flashmap_bulk_insert")
             .ok_or_else(|| FlashMapError::KernelLaunch("flashmap_bulk_insert not found".into()))?;
 
         let grid = ((n as u32 + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK, 1, 1);
@@ -280,7 +295,7 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
 
         let func = self
             .device
-            .get_func(MODULE_NAME, "flashmap_bulk_remove")
+            .get_func(MODULE_QUERY, "flashmap_bulk_remove")
             .ok_or_else(|| FlashMapError::KernelLaunch("flashmap_bulk_remove not found".into()))?;
 
         // Warp-cooperative: 1 warp (32 threads) per query
@@ -338,7 +353,7 @@ impl<K: Pod, V: Pod> GpuFlashMap<K, V> {
     pub fn clear(&mut self) -> Result<(), FlashMapError> {
         let func = self
             .device
-            .get_func(MODULE_NAME, "flashmap_clear")
+            .get_func(MODULE_INSERT, "flashmap_clear")
             .ok_or_else(|| FlashMapError::KernelLaunch("flashmap_clear not found".into()))?;
 
         let grid = (

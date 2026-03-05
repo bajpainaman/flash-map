@@ -199,6 +199,22 @@ __device__ __forceinline__ void fm_swap(
 }
 
 // ============================================================================
+// Conditional compilation: define COMPILE_INSERT or COMPILE_QUERY from
+// the host to compile each kernel set as a separate PTX module. This
+// isolates register allocation so warp-coop intrinsics don't spill the
+// insert kernel's local arrays.
+//
+// If neither is defined, all kernels compile together (single-module mode).
+// ============================================================================
+
+#if !defined(COMPILE_INSERT) && !defined(COMPILE_QUERY)
+#define COMPILE_INSERT
+#define COMPILE_QUERY
+#endif
+
+// ============================================================================
+#ifdef COMPILE_QUERY
+// ============================================================================
 // Warp-Cooperative Bulk Lookup
 //
 // 1 warp (32 threads) handles 1 query. Each iteration, 32 lanes probe 32
@@ -324,6 +340,12 @@ extern "C" __global__ void flashmap_bulk_get(
 }
 
 // ============================================================================
+#endif // COMPILE_QUERY
+// ============================================================================
+
+// ============================================================================
+#ifdef COMPILE_INSERT
+// ============================================================================
 // Bulk Insert — Robin Hood with eviction (1 thread per key)
 //
 // Insert stays thread-per-key because Robin Hood eviction chains are
@@ -422,6 +444,36 @@ extern "C" __global__ void flashmap_bulk_insert(
 }
 
 // ============================================================================
+// Utility kernels (part of insert module — simple thread-per-slot)
+// ============================================================================
+
+extern "C" __global__ void flashmap_clear(
+    unsigned int* __restrict__ flags,
+    unsigned long long capacity
+) {
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= capacity) return;
+    flags[tid] = FLAG_EMPTY;
+}
+
+extern "C" __global__ void flashmap_count(
+    const unsigned int* __restrict__ flags,
+    unsigned long long capacity,
+    unsigned int* __restrict__ count
+) {
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= capacity) return;
+    if (GET_FLAG(flags[tid]) == FLAG_OCCUPIED)
+        atomicAdd(count, 1u);
+}
+
+// ============================================================================
+#endif // COMPILE_INSERT
+// ============================================================================
+
+// ============================================================================
+#ifdef COMPILE_QUERY
+// ============================================================================
 // Warp-Cooperative Bulk Remove — Robin Hood early exit + atomicCAS tombstone
 //
 // Same warp-cooperative pattern as bulk_get: 1 warp per query, 32 slots
@@ -510,25 +562,5 @@ extern "C" __global__ void flashmap_bulk_remove(
 }
 
 // ============================================================================
-// Utility kernels
+#endif // COMPILE_QUERY
 // ============================================================================
-
-extern "C" __global__ void flashmap_clear(
-    unsigned int* __restrict__ flags,
-    unsigned long long capacity
-) {
-    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= capacity) return;
-    flags[tid] = FLAG_EMPTY;
-}
-
-extern "C" __global__ void flashmap_count(
-    const unsigned int* __restrict__ flags,
-    unsigned long long capacity,
-    unsigned int* __restrict__ count
-) {
-    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= capacity) return;
-    if (GET_FLAG(flags[tid]) == FLAG_OCCUPIED)
-        atomicAdd(count, 1u);
-}
